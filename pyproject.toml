@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "LoRCnn"
+version = "1.0"
+description = "NONE"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "torch==2.1.1",
+    "transformers==4.34.1",
+    "accelerate==0.24.0",
+    "fschat==0.2.36",
+    "openai==1.54.5",
+    "anthropic==0.39.0",
+    "sentencepiece==0.2.0",
+    "protobuf==5.28.3",
+    "numpy==1.26.4",
+    "datasets==2.14.7",
+    "huggingface-hub==0.17.3",
+    "shortuuid==1.0.13",
+    "jieba==0.42.1",
+    "fuzzywuzzy==0.18.0",
+    "rouge==1.0.1",
+    "bitsandbytes==0.43.3",
+    "flash-attn==2.4.0.post1"
+]
+
+[tool.setuptools.packages.find]
+exclude = ["train*"]
