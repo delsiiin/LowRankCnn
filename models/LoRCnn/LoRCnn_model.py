@@ -24,7 +24,215 @@ import torch.nn.functional as F
 
 from .modeling_llama_cnn import LlamaForCausalLM as BaseLlamaForCausalLM
 from .modeling_llama_cnn import LlamaAttention as BaseLlamaAttention
+from .modeling_llama_cnn import LlamaDecoderLayer as BaseLlamaDecoderLayer
+from .modeling_llama_cnn import apply_rotary_pos_emb
 from transformers.models.llama.configuration_llama import LlamaConfig
+
+class LoRCnnAttention(nn.Module):
+
+    def __init__(self, config: LoRCnnConfig, idx, base_model):
+        super().__init__()
+
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.max_position_embeddings = config.max_position_embeddings
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+        self.q_proj = base_model.model.layers[idx].self_attn.q_proj
+        self.k_proj = base_model.model.layers[idx].self_attn.k_proj
+        self.v_proj = base_model.model.layers[idx].self_attn.v_proj
+        self.o_proj = base_model.model.layers[idx].self_attn.o_proj
+        self.rotary_emb = base_model.model.layers[idx].self_attn.rotary_emb
+
+        self.attn_down_proj_dim = self.config.attn_down_proj_dim // self.config.num_attention_heads
+        self.num_deep_cnn_layers = self.config.num_deep_cnn_layers
+        self.inner_channel = self.config.inner_channel
+
+        self.attn_down_proj_q = nn.Linear(self.config.hidden_size // self.config.num_attention_heads, self.attn_down_proj_dim, bias=False)
+        self.attn_down_proj_k = nn.Linear(self.config.hidden_size // self.config.num_attention_heads, self.attn_down_proj_dim, bias=False) 
+
+        self.attention_predictor_cnn = nn.Sequential(
+                nn.LayerNorm(self.config.max_position_embeddings),
+                *[
+                    deep_layer
+                    for _ in range(self.num_deep_cnn_layers)
+                    for deep_layer in (
+                        CausalConv2d(self.inner_channel*self.config.num_attention_heads, self.inner_channel*self.config.num_attention_heads, (63,1), padding=(63 // 2 * 1, 0), dilation=(1, 1), stride=(1,1), groups=self.config.num_attention_heads),
+                        nn.ReLU(),
+                    )
+                ],
+                nn.LayerNorm(self.config.max_position_embeddings)
+            ) 
+
+        self.attention_predictor_dec_scaler = nn.Linear(self.config.max_position_embeddings, 1)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+
+        if past_key_value is not None:
+            kv_seq_len += past_key_value[0].shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        
+        # <<< LoRCnn >>>
+        query_states = self.attn_down_proj_q(query_states)
+        key_states = self.attn_down_proj_k(key_states)
+        # <<< LoRCnn >>>
+
+        if past_key_value is not None:
+            # reuse k, v, self_attention
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+        past_key_value = (key_states, value_states) if use_cache else None
+
+        # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # <<< LoRCnn >>>
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.attn_down_proj_dim)
+        estimated_scale = self.attention_predictor_dec_scaler(attn_weights)
+        # <<< LoRCnn >>>
+
+        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+
+        # <<< LoRCnn >>>
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = self.attention_predictor_cnn(attn_weights)
+            attn_weights = attn_weights + attention_mask
+            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
+        # <<< LoRCnn >>>
+
+        # upcast attention to fp32
+        # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+        # <<< LoRCnn >>>
+        if self.training:
+            with torch.autocast('cuda', torch.float32):
+                # return DUMMY_OUTPUT #1778
+                # attn_weights = F.log_softmax(attn_weights.to(torch.float32), dim=-1, dtype=torch.float32).to(query_states.dtype)
+                attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                attn_weights = attn_weights * torch.sigmoid(estimated_scale)
+        else:
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = attn_weights * torch.sigmoid(estimated_scale)
+        # <<< LoRCnn >>>
+
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+    
+class LoRCnnLlamaDecoderLayer(nn.Module):
+    def __init__(self, config: LoRCnnConfig, idx, base_model):
+        super().__init__()
+
+        self.hidden_size = config.hidden_size
+        self.self_attn = LoRCnnAttention(config, idx, base_model)
+        self.mlp = base_model.model.layers[idx].mlp
+        self.input_layernorm = base_model.model.layers[idx].input_layernorm
+        self.post_attention_layernorm = base_model.model.layers[idx].post_attention_layernorm 
+        
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+            attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
+                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
+            output_attentions (`bool`, *optional*):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more detail.
+            use_cache (`bool`, *optional*):
+                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
+                (see `past_key_values`).
+            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+        """
+
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+
+        # <<< LoRCnn >>>
+        attn_output = hidden_states
+        # <<< LoRCnn >>>
+
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            # <<< LoRCnn >>>
+            outputs += (self_attn_weights, attn_output,)
+            # <<< LoRCnn >>>
+
+        if use_cache:
+            outputs += (present_key_value,)
+
+        return outputs
 
 class LoRCnnModel(nn.Module):
 
@@ -39,31 +247,7 @@ class LoRCnnModel(nn.Module):
 
         self.config = LoRCnn_config
 
-        self.attn_down_proj_dim = self.config.attn_down_proj_dim // self.config.num_attention_heads
-        self.num_deep_cnn_layers = self.config.num_deep_cnn_layers
-        self.inner_channel = self.config.inner_channel
-
-        self.attn_down_proj_qs = nn.ModuleList([nn.Linear(self.config.hidden_size // self.config.num_attention_heads, self.attn_down_proj_dim, bias=False) for _ in range(self.config.num_hidden_layers)])
-        self.attn_down_proj_ks = nn.ModuleList([nn.Linear(self.config.hidden_size // self.config.num_attention_heads, self.attn_down_proj_dim, bias=False) for _ in range(self.config.num_hidden_layers)])
-
-        self.attention_predictor_cnns = nn.ModuleList([
-            nn.Sequential(
-                nn.LayerNorm(self.config.max_position_embeddings),
-                *[
-                    deep_layer
-                    for _ in range(self.num_deep_cnn_layers)
-                    for deep_layer in (
-                        CausalConv2d(self.inner_channel*self.config.num_attention_heads, self.inner_channel*self.config.num_attention_heads, (63,1), padding=(63 // 2 * 1, 0), dilation=(1, 1), stride=(1,1), groups=self.config.num_attention_heads),
-                        nn.ReLU(),
-                    )
-                ],
-                nn.LayerNorm(self.config.max_position_embeddings)
-            ) for _ in range(self.config.num_hidden_layers)
-        ])
-
-        self.attention_predictor_dec_scalers = nn.ModuleList([
-            nn.Linear(self.config.max_position_embeddings, 1) for _ in range(self.config.num_hidden_layers)
-        ])
+        self.LoRCNN_layers = nn.ModuleList([LoRCnnLlamaDecoderLayer(LoRCnn_config, idx, base_model) for idx in range(LoRCnn_config.num_hidden_layers)])
 
         self.device = base_model.model.layers[-1].self_attn.q_proj.weight.device
 
@@ -211,9 +395,8 @@ class LoRCnnModel(nn.Module):
         )
 
         hidden_states = inputs_embeds
-    
-        # hidden_states_base = inputs_embeds.clone()
 
+        hidden_states_base = inputs_embeds.detach()
     
         # if self.gradient_checkpointing and self.training:
         #     if use_cache:
@@ -240,15 +423,25 @@ class LoRCnnModel(nn.Module):
 
             if self.training:
 
+                with torch.no_grad():
+                    layer_outputs_base = decoder_layer(
+                        hidden_states_base,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value,
+                        output_attentions=True,
+                        use_cache=use_cache,
+                    )
+
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # None for past_key_value
-                        return module(*inputs, True, None, True, self.attn_down_proj_dim, self.attn_down_proj_qs[idx], self.attn_down_proj_ks[idx], self.attention_predictor_cnns[idx], self.attention_predictor_dec_scalers[idx])
+                        return module(*inputs, True, None)
 
                     return custom_forward
 
                 layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(decoder_layer),
+                    create_custom_forward(self.LoRCNN_layers[idx]),
                     hidden_states,
                     attention_mask,
                     position_ids,
@@ -274,45 +467,50 @@ class LoRCnnModel(nn.Module):
 
             
             if self.training:
+                # hidden_states_base = layer_outputs_base[0].detach()
+                # hidden_states = layer_outputs[0]
+
+                # attn_weights_base = layer_outputs_base[1].detach()
+                # attn_weights = layer_outputs[1]
+
+                # attn_output_base = layer_outputs_base[2]
+                # attn_output = layer_outputs[2]
+
+                hidden_states_base = layer_outputs_base[0].detach()
                 hidden_states = layer_outputs[0]
-                hidden_states_cnn = layer_outputs[1]
 
-                attn_weights = layer_outputs[2]
-                attn_weights_cnn = layer_outputs[4]
+                attn_weights_base = layer_outputs_base[1].detach()
+                attn_weights = layer_outputs[1]
 
-                # if idx < 5:
-                #     print(attn_weights, "attn_weights")
-                #     print(attn_weights_base, "attn_weights_base")
-
-                # attn_output = layer_outputs[3]
-                # attn_output_cnn = layer_outputs[5]
+                attn_output_base = layer_outputs_base[2].detach()
+                attn_output = layer_outputs[2]
 
                 with torch.autocast('cuda', torch.float32):
                     loss_attn_weights += F.kl_div(
-                        F.log_softmax(attn_weights_cnn.to(torch.float32).view(-1, attn_weights_cnn.shape[-1]), dim=-1, dtype=torch.float32),
-                        F.softmax(attn_weights.to(torch.float32).view(-1, attn_weights.shape[-1]), dim=-1, dtype=torch.float32),
+                        F.log_softmax(attn_weights.to(torch.float32).view(-1, attn_weights.shape[-1]), dim=-1, dtype=torch.float32),
+                        F.softmax(attn_weights_base.to(torch.float32).view(-1, attn_weights_base.shape[-1]), dim=-1, dtype=torch.float32),
                         reduction='batchmean',
                     ) * 0.1
                     # return DUMMY_OUTPUT #2738
                     loss_attn_weights += F.mse_loss(
-                        F.softmax(attn_weights_cnn.to(torch.float32).view(-1, attn_weights_cnn.shape[-1]), dim=-1, dtype=torch.float32), 
-                        F.softmax(attn_weights.to(torch.float32).view(-1, attn_weights.shape[-1]), dim=-1, dtype=torch.float32),
+                        F.softmax(attn_weights.to(torch.float32).view(-1, attn_weights.shape[-1]), dim=-1, dtype=torch.float32), 
+                        F.softmax(attn_weights_base.to(torch.float32).view(-1, attn_weights_base.shape[-1]), dim=-1, dtype=torch.float32),
                     )
                     # del attn_weights
                     # del attn_weights_base
 
-                print(loss_attn_weights, "loss_attn_weights")
+                # print(loss_attn_weights, "loss_attn_weights")
 
-                # loss_attn_output += F.mse_loss(
-                #     attn_output_cnn, 
-                #     attn_output
-                # )
+                loss_attn_output += F.mse_loss(
+                    attn_output, 
+                    attn_output_base
+                )
                 # # del attn_output
                 # # del attn_output_base
 
                 # print(loss_attn_output, "loss_attn_output")
 
-                # loss_per_layer += F.mse_loss(hidden_states_cnn.to(torch.float32), hidden_states.to(torch.float32))
+                loss_per_layer += F.mse_loss(hidden_states.to(torch.float32), hidden_states_base.to(torch.float32))
 
                 # print(loss_per_layer, "loss_per_layer")
 
@@ -324,7 +522,7 @@ class LoRCnnModel(nn.Module):
         if self.training:
             total_loss_avg = (loss_per_layer + loss_attn_output + loss_attn_weights) / len(self.base_model.model.layers)
 
-            print(total_loss_avg, "total_loss_avg")
+            # print(total_loss_avg, "total_loss_avg")
 
             # hidden_states_base = self.base_model.model.norm(hidden_states_base)
         hidden_states = self.base_model.model.norm(hidden_states)
@@ -335,32 +533,32 @@ class LoRCnnModel(nn.Module):
 
         next_cache = next_decoder_cache if use_cache else None
 
-        outputs = tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, hidden_states_cnn, total_loss_avg] if v is not None)
+        outputs = tuple(v for v in [hidden_states_base, next_cache, all_hidden_states, all_self_attns, hidden_states, total_loss_avg] if v is not None)
         
-        hidden_states = outputs[0]
-        logits = self.base_model.lm_head(hidden_states)
+        hidden_states_base = outputs[0].detach()
+        logits_base = self.base_model.lm_head(hidden_states_base).detach()
 
         final_loss = None
 
         if self.training:
-            # hidden_states_cnn = outputs[-2]
-            # logits_cnn = self.base_model.lm_head(hidden_states_cnn)
+            hidden_states = outputs[-2]
+            logits = self.base_model.lm_head(hidden_states)
 
-            # # del hidden_states_base
+            # del hidden_states_base
 
-            # loss_kd = F.kl_div(
-            #     F.log_softmax(logits_cnn, dim=-1, dtype=torch.float32), 
-            #     F.softmax(logits, dim=-1, dtype=torch.float32),
-            #     reduction='batchmean',
-            # ) * 0.2
+            loss_kd = F.kl_div(
+                F.log_softmax(logits, dim=-1, dtype=torch.float32), 
+                F.softmax(logits_base, dim=-1, dtype=torch.float32),
+                reduction='batchmean',
+            ) * 0.2
 
             # print(loss_kd, "loss_kd")
 
             # # del logits_base
 
-            final_loss = total_loss_avg + 0
+            final_loss = total_loss_avg + loss_kd
 
-            print(final_loss, "final_loss")
+            # print(final_loss, "final_loss")
         
         return_dict = False
         if not return_dict:

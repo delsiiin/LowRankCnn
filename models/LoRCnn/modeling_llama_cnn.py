@@ -191,12 +191,6 @@ class LlamaAttention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cnn_mode: bool = False,
-        attn_down_proj_dim = None,
-        down_proj_q_per_layer = None,
-        down_proj_k_per_layer = None,
-        attention_predictor_cnn_per_layer = None,
-        attention_predictor_dec_scaler_per_layer = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -205,7 +199,6 @@ class LlamaAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
-        
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
@@ -250,116 +243,6 @@ class LlamaAttention(nn.Module):
 
         attn_output = self.o_proj(attn_output)
 
-        # if not output_attentions:
-        #     attn_weights = None
-
-        # return attn_output, attn_weights, past_key_value
-        if cnn_mode:
-
-            attn_output_cnn, attn_weights_cnn, past_key_value_cnn = self.LoRCnn_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                attn_down_proj_dim=attn_down_proj_dim,
-                down_proj_q_per_layer=down_proj_q_per_layer,
-                down_proj_k_per_layer=down_proj_k_per_layer,
-                attention_predictor_cnn_per_layer=attention_predictor_cnn_per_layer,
-                attention_predictor_dec_scaler_per_layer=attention_predictor_dec_scaler_per_layer,
-            )
-        
-            attn_output_cnn = self.o_proj(attn_output_cnn)
-
-            if not output_attentions:
-                attn_weights = None
-
-            return attn_output, attn_weights, past_key_value, attn_output_cnn, attn_weights_cnn, past_key_value_cnn
-    
-    def LoRCnn_attn(
-        self,
-        hidden_states,
-        attention_mask,
-        position_ids,
-        past_key_value,
-        output_attentions,
-        use_cache,
-        attn_down_proj_dim,
-        down_proj_q_per_layer,
-        down_proj_k_per_layer,
-        attention_predictor_cnn_per_layer,
-        attention_predictor_dec_scaler_per_layer,
-    ):
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        kv_seq_len = key_states.shape[-2]
-
-        # <<< LoRCnn >>>
-        query_states = down_proj_q_per_layer(query_states)
-        key_states = down_proj_k_per_layer(key_states)
-        # <<< LoRCnn >>>
-
-        if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
-        past_key_value = (key_states, value_states) if use_cache else None
-
-        # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        # <<< LoRCnn >>>
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(attn_down_proj_dim)
-        estimated_scale = attention_predictor_dec_scaler_per_layer(attn_weights)
-        # <<< LoRCnn >>>
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        # <<< LoRCnn >>>
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attention_predictor_cnn_per_layer(attn_weights)
-            attn_weights = attn_weights + attention_mask
-            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
-        # <<< LoRCnn >>>
-
-        # upcast attention to fp32
-        # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-        # <<< LoRCnn >>>
-        if self.training:
-            with torch.autocast('cuda', torch.float32):
-                # return DUMMY_OUTPUT #1778
-                # attn_weights = F.log_softmax(attn_weights.to(torch.float32), dim=-1, dtype=torch.float32).to(query_states.dtype)
-                attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-                attn_weights = attn_weights * torch.sigmoid(estimated_scale)
-        else:
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            attn_weights = attn_weights * torch.sigmoid(estimated_scale)
-        # <<< LoRCnn >>>
-
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
         if not output_attentions:
             attn_weights = None
 
@@ -387,12 +270,6 @@ class LlamaDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        cnn_mode: bool = False,
-        attn_down_proj_dim = None,
-        down_proj_q_per_layer = None,
-        down_proj_k_per_layer = None,
-        attention_predictor_cnn_per_layer = None,
-        attention_predictor_dec_scaler_per_layer = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -413,70 +290,36 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        if cnn_mode:
-            hidden_states, self_attn_weights, present_key_value, hidden_states_cnn, self_attn_weights_cnn, present_key_value_cnn = self.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cnn_mode=cnn_mode,
-                attn_down_proj_dim=attn_down_proj_dim,
-                down_proj_q_per_layer=down_proj_q_per_layer,
-                down_proj_k_per_layer=down_proj_k_per_layer,
-                attention_predictor_cnn_per_layer=attention_predictor_cnn_per_layer,
-                attention_predictor_dec_scaler_per_layer=attention_predictor_dec_scaler_per_layer,
-            )
-        else:
-            hidden_states, self_attn_weights, present_key_value = self.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-            )
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
 
         # <<< LoRCnn >>>
         attn_output = hidden_states
-        attn_output_cnn = hidden_states_cnn
         # <<< LoRCnn >>>
 
-        if cnn_mode:
-            hidden_states = residual + hidden_states
+        hidden_states = residual + hidden_states
 
-            # Fully Connected
-            residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states)
-            hidden_states = residual + hidden_states
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
 
-            hidden_states_cnn = residual + hidden_states_cnn
-
-            # Fully Connected
-            residual = hidden_states_cnn
-            hidden_states_cnn = self.post_attention_layernorm(hidden_states_cnn)
-            hidden_states_cnn = self.mlp(hidden_states_cnn)
-            hidden_states_cnn = residual + hidden_states_cnn
-        else:
-            hidden_states = residual + hidden_states
-
-            # Fully Connected
-            residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states)
-            hidden_states = residual + hidden_states
-
-        outputs = (hidden_states, hidden_states_cnn)
+        outputs = (hidden_states,)
 
         if output_attentions:
             # <<< LoRCnn >>>
-            outputs += (self_attn_weights, attn_output, self_attn_weights_cnn, attn_output_cnn)
+            outputs += (self_attn_weights, attn_output,)
             # <<< LoRCnn >>>
 
         if use_cache:
-            outputs += (present_key_value, present_key_value_cnn)
+            outputs += (present_key_value,)
 
         return outputs
 
