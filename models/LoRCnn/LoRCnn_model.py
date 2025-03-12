@@ -38,6 +38,7 @@ class LoRCnnAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.max_position_embeddings = config.max_position_embeddings
+        self.kernel_size = config.kernel_size
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -63,7 +64,7 @@ class LoRCnnAttention(nn.Module):
                     deep_layer
                     for _ in range(self.num_deep_cnn_layers)
                     for deep_layer in (
-                        CausalConv2d(self.inner_channel*self.config.num_attention_heads, self.inner_channel*self.config.num_attention_heads, (63,1), padding=(63 // 2 * 1, 0), dilation=(1, 1), stride=(1,1), groups=self.config.num_attention_heads),
+                        CausalConv2d(self.inner_channel*self.config.num_attention_heads, self.inner_channel*self.config.num_attention_heads, (self.kernel_size,1), padding=(self.kernel_size // 2 * 1, 0), dilation=(1, 1), stride=(1,1), groups=self.config.num_attention_heads),
                         nn.ReLU(),
                     )
                 ],
@@ -133,13 +134,9 @@ class LoRCnnAttention(nn.Module):
         # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
         # <<< LoRCnn >>>
-        if self.training:
-            with torch.autocast('cuda', torch.float32):
-                # return DUMMY_OUTPUT #1778
-                # attn_weights = F.log_softmax(attn_weights.to(torch.float32), dim=-1, dtype=torch.float32).to(query_states.dtype)
-                attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-                attn_weights = attn_weights * torch.sigmoid(estimated_scale)
-        else:
+        with torch.autocast('cuda', torch.float32):
+            # return DUMMY_OUTPUT #1778
+            # attn_weights = F.log_softmax(attn_weights.to(torch.float32), dim=-1, dtype=torch.float32).to(query_states.dtype)
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             attn_weights = attn_weights * torch.sigmoid(estimated_scale)
         # <<< LoRCnn >>>
@@ -253,6 +250,8 @@ class LoRCnnModel(nn.Module):
 
         self.dtype = self.base_model.dtype
 
+        self.loss_type = LoRCnn_config.loss_type
+
     def enable_input_require_grads(self):
         """
         Enables the gradients for the input embeddings. This is useful for fine-tuning adapter weights while keeping
@@ -303,44 +302,22 @@ class LoRCnnModel(nn.Module):
             LoRCnn_config
         )
 
-        LoRCnn_attn_down_proj_qs_path = os.path.join(LoRCnn_model_path, "attn_down_proj_qs.pt")
-        if os.path.exists(LoRCnn_attn_down_proj_qs_path):
-            filename = LoRCnn_attn_down_proj_qs_path
-        else:
-            filename = hf_hub_download(LoRCnn_model_path, "ssd_model.pt")
-        LoRCnn_state_dict = torch.load(filename, map_location=base_model.device)
-        model.attn_down_proj_qs.load_state_dict(LoRCnn_state_dict, strict=False)
+        LoRCnn_weights_path = os.path.join(LoRCnn_model_path, "LoRCNN_weights.bin")
+        # 加载 .bin 文件
+        loaded_weights = torch.load(LoRCnn_weights_path)
 
-        LoRCnn_attn_down_proj_ks_path = os.path.join(LoRCnn_model_path, "attn_down_proj_ks.pt")
-        if os.path.exists(LoRCnn_attn_down_proj_ks_path):
-            filename = LoRCnn_attn_down_proj_ks_path
-        else:
-            filename = hf_hub_download(LoRCnn_model_path, "ssd_model.pt")
-        LoRCnn_state_dict = torch.load(filename, map_location=base_model.device)
-        model.attn_down_proj_ks.load_state_dict(LoRCnn_state_dict, strict=False)
+        # 遍历模型并加载参数
+        for name, param in model.named_parameters():
+            if name in loaded_weights:
+                param.data.copy_(loaded_weights[name])
 
-        LoRCnn_attention_predictor_cnns_path = os.path.join(LoRCnn_model_path, "attention_predictor_cnns.pt")
-        if os.path.exists(LoRCnn_attention_predictor_cnns_path):
-            filename = LoRCnn_attention_predictor_cnns_path
-        else:
-            filename = hf_hub_download(LoRCnn_model_path, "ssd_model.pt")
-        LoRCnn_state_dict = torch.load(filename, map_location=base_model.device)
-        model.attention_predictor_cnns.load_state_dict(LoRCnn_state_dict, strict=False)
-
-        LoRCnn_attention_predictor_dec_scalers_path = os.path.join(LoRCnn_model_path, "attention_predictor_dec_scalers.pt")
-        if os.path.exists(LoRCnn_attention_predictor_dec_scalers_path):
-            filename = LoRCnn_attention_predictor_dec_scalers_path
-        else:
-            filename = hf_hub_download(LoRCnn_model_path, "ssd_model.pt")
-        LoRCnn_state_dict = torch.load(filename, map_location=base_model.device)
-        model.attention_predictor_dec_scalers.load_state_dict(LoRCnn_state_dict, strict=False)
-
-        return model
+                return model
 
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -396,7 +373,8 @@ class LoRCnnModel(nn.Module):
 
         hidden_states = inputs_embeds
 
-        hidden_states_base = inputs_embeds.detach()
+        if self.loss_type == "distillation":
+            hidden_states_base = inputs_embeds.detach()
     
         # if self.gradient_checkpointing and self.training:
         #     if use_cache:
@@ -410,10 +388,12 @@ class LoRCnnModel(nn.Module):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
-        if self.training:
-            loss_attn_weights = 0
-            loss_attn_output = 0
-            loss_per_layer = 0
+        loss_attn_weights = 0
+        loss_attn_output = 0
+        loss_per_layer = 0
+        total_loss_avg = 0
+        loss_kd = 0
+        final_loss = 0
 
         for idx, decoder_layer in enumerate(self.base_model.model.layers):
             # if output_hidden_states:
@@ -423,22 +403,31 @@ class LoRCnnModel(nn.Module):
 
             if self.training:
 
-                with torch.no_grad():
-                    layer_outputs_base = decoder_layer(
-                        hidden_states_base,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_value,
-                        output_attentions=True,
-                        use_cache=use_cache,
-                    )
+                if self.loss_type == "distillation":
+                    with torch.no_grad():
+                        layer_outputs_base = decoder_layer(
+                            hidden_states_base,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            past_key_value=past_key_value,
+                            output_attentions=True,
+                            use_cache=use_cache,
+                        )
+                if self.loss_type == "distillation":
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            # None for past_key_value
+                            return module(*inputs, True, None)
 
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        # None for past_key_value
-                        return module(*inputs, True, None)
+                        return custom_forward
+                    
+                elif self.loss_type == "task":
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            # None for past_key_value
+                            return module(*inputs, False, None)
 
-                    return custom_forward
+                        return custom_forward
 
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(self.LoRCNN_layers[idx]),
@@ -450,39 +439,44 @@ class LoRCnnModel(nn.Module):
 
             else:
                 
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cnn_mode=True,
-                    attn_down_proj_dim=self.attn_down_proj_dim,
-                    down_proj_q_per_layer=self.attn_down_proj_qs[idx],
-                    down_proj_k_per_layer=self.attn_down_proj_ks[idx],
-                    attention_predictor_cnn_per_layer=self.attention_predictor_cnns[idx],
-                    attention_predictor_dec_scaler_per_layer=self.attention_predictor_dec_scalers[idx],
-                )
+                if self.loss_type == "distillation":
+                    layer_outputs_base = decoder_layer(
+                        hidden_states_base,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value,
+                        output_attentions=True,
+                        use_cache=use_cache,
+                    )
+                    layer_outputs = self.LoRCNN_layers[idx](
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value,
+                        output_attentions=True,
+                        use_cache=use_cache,
+                    )
+
+                elif self.loss_type == "task":
+                    layer_outputs = self.LoRCNN_layers[idx](
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value,
+                        output_attentions=False,
+                        use_cache=use_cache,
+                    )
 
             
-            if self.training:
-                # hidden_states_base = layer_outputs_base[0].detach()
-                # hidden_states = layer_outputs[0]
-
-                # attn_weights_base = layer_outputs_base[1].detach()
-                # attn_weights = layer_outputs[1]
-
-                # attn_output_base = layer_outputs_base[2]
-                # attn_output = layer_outputs[2]
-
+            if self.loss_type == "distillation":
                 hidden_states_base = layer_outputs_base[0].detach()
-                hidden_states = layer_outputs[0]
+            hidden_states = layer_outputs[0]
 
+            if self.loss_type == "distillation":
                 attn_weights_base = layer_outputs_base[1].detach()
                 attn_weights = layer_outputs[1]
 
-                attn_output_base = layer_outputs_base[2].detach()
+                attn_output_base = layer_outputs_base[2]
                 attn_output = layer_outputs[2]
 
                 with torch.autocast('cuda', torch.float32):
@@ -493,8 +487,8 @@ class LoRCnnModel(nn.Module):
                     ) * 0.1
                     # return DUMMY_OUTPUT #2738
                     loss_attn_weights += F.mse_loss(
-                        F.softmax(attn_weights.to(torch.float32).view(-1, attn_weights.shape[-1]), dim=-1, dtype=torch.float32), 
-                        F.softmax(attn_weights_base.to(torch.float32).view(-1, attn_weights_base.shape[-1]), dim=-1, dtype=torch.float32),
+                        attn_weights.to(torch.float32).view(-1, attn_weights.shape[-1]), 
+                        attn_weights_base.to(torch.float32).view(-1, attn_weights_base.shape[-1]),
                     )
                     # del attn_weights
                     # del attn_weights_base
@@ -512,19 +506,18 @@ class LoRCnnModel(nn.Module):
 
                 loss_per_layer += F.mse_loss(hidden_states.to(torch.float32), hidden_states_base.to(torch.float32))
 
-                # print(loss_per_layer, "loss_per_layer")
+            # print(loss_per_layer, "loss_per_layer")
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
             # if output_attentions:
             #     all_self_attns += (layer_outputs[1],)
-        if self.training:
-            total_loss_avg = (loss_per_layer + loss_attn_output + loss_attn_weights) / len(self.base_model.model.layers)
+        if self.loss_type == "distillation":
+            total_loss_avg += (loss_per_layer + loss_attn_output + loss_attn_weights) / len(self.base_model.model.layers)
 
             # print(total_loss_avg, "total_loss_avg")
 
-            # hidden_states_base = self.base_model.model.norm(hidden_states_base)
         hidden_states = self.base_model.model.norm(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -533,20 +526,17 @@ class LoRCnnModel(nn.Module):
 
         next_cache = next_decoder_cache if use_cache else None
 
-        outputs = tuple(v for v in [hidden_states_base, next_cache, all_hidden_states, all_self_attns, hidden_states, total_loss_avg] if v is not None)
-        
-        hidden_states_base = outputs[0].detach()
-        logits_base = self.base_model.lm_head(hidden_states_base).detach()
+        if self.loss_type == "distillation":
+            
+            hidden_states_base = self.base_model.model.norm(hidden_states_base)
 
-        final_loss = None
+            logits_base = self.base_model.lm_head(hidden_states_base).detach()
 
-        if self.training:
-            hidden_states = outputs[-2]
             logits = self.base_model.lm_head(hidden_states)
 
             # del hidden_states_base
 
-            loss_kd = F.kl_div(
+            loss_kd += F.kl_div(
                 F.log_softmax(logits, dim=-1, dtype=torch.float32), 
                 F.softmax(logits_base, dim=-1, dtype=torch.float32),
                 reduction='batchmean',
@@ -555,10 +545,15 @@ class LoRCnnModel(nn.Module):
             # print(loss_kd, "loss_kd")
 
             # # del logits_base
+        elif self.loss_type == "task":
 
-            final_loss = total_loss_avg + loss_kd
+            logits = self.base_model.lm_head(hidden_states)
 
-            # print(final_loss, "final_loss")
+        final_loss += total_loss_avg + loss_kd
+
+        # print(final_loss, "final_loss")
+
+        outputs = tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         
         return_dict = False
         if not return_dict:
