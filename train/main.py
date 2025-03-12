@@ -89,19 +89,21 @@ def replace_compute_loss_cross_entropy():
 
         logits = outputs[1]
 
-        labels = inputs["labels"]
+        if loss == 0:
 
-        loss_fct = CrossEntropyLoss()
+            labels = inputs["labels"]
 
-        # Shift so that tokens < n predict n
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        # Flatten the tokens
-        shift_logits = shift_logits.view(-1, shift_logits.shape[-1])
-        shift_labels = shift_labels.view(-1)
-        # Enable model parallelism
-        shift_labels = shift_labels.to(shift_logits.device)
-        loss += loss_fct(shift_logits, shift_labels)
+            loss_fct = CrossEntropyLoss()
+
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            shift_logits = shift_logits.view(-1, shift_logits.shape[-1])
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss += loss_fct(shift_logits, shift_labels)
         
         return (loss, logits) if return_outputs else loss
     
@@ -155,9 +157,17 @@ class TrainingArguments(transformers.TrainingArguments):
         default=2,
         metadata={"help": "Number of deep CNN layers."},
     )
+    kernel_size: int = field(
+        default=63,
+        metadata={"help": "Kernel size for deep CNN layers."},
+    )
     inner_channel: int = field(
         default=1,
         metadata={"help": "Inner channel for deep CNN layers."},
+    )
+    loss_type: str = field(
+        default="task",
+        metadata={"help": "Loss type."},
     )
     vsdebug: bool = field(
         default=False,
@@ -236,6 +246,8 @@ def train():
         attn_down_proj_dim=training_args.attn_down_proj_dim,
         num_deep_cnn_layers=training_args.num_deep_cnn_layers,
         inner_channel=training_args.inner_channel,
+        kernel_size=training_args.kernel_size,
+        loss_type=training_args.loss_type,
         **config.to_dict()  # Inherit all parameters from the base config
     )
 
