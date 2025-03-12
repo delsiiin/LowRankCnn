@@ -80,14 +80,30 @@ def replace_compute_loss_cross_entropy():
         Returns:
             Union[float, Tuple[float, torch.Tensor]]: The computed loss, optionally with model outputs.
         """
-
+        
         outputs = model(
             input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"]
         )
 
         loss = outputs[0]
+
+        logits = outputs[1]
+
+        labels = inputs["labels"]
+
+        loss_fct = CrossEntropyLoss()
+
+        # Shift so that tokens < n predict n
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        shift_logits = shift_logits.view(-1, shift_logits.shape[-1])
+        shift_labels = shift_labels.view(-1)
+        # Enable model parallelism
+        shift_labels = shift_labels.to(shift_logits.device)
+        loss += loss_fct(shift_logits, shift_labels)
         
-        return loss
+        return (loss, logits) if return_outputs else loss
     
     transformers.trainer.Trainer.compute_loss = compute_loss
 
@@ -304,41 +320,29 @@ def train():
     # trainer.save_state()
     # safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
-    for name, param in LoRCnn_model.named_parameters():
-        if "attn_down_proj" in name or "attention_predictor" in name:
-            torch.save(
-                param,
-                os.path.join(training_args.output_dir, f"{name.replace('.', '_')}.pt"),
-            )
-
     if hasattr(LoRCnn_model, "module"):
-        LoRCnn_model_attn_down_proj_qs = LoRCnn_model.module.attn_down_proj_qs
-        LoRCnn_model_attn_down_proj_ks = LoRCnn_model.module.attn_down_proj_ks
-        LoRCnn_model_attention_predictor_cnns = LoRCnn_model.module.attention_predictor_cnns
-        LoRCnn_model_attention_predictor_dec_scalers = LoRCnn_model.module.attention_predictor_dec_scalers
+        LoRCNN_layers = LoRCnn_model.module.LoRCNN_layers
     else:
-        LoRCnn_model_attn_down_proj_qs = LoRCnn_model.attn_down_proj_qs
-        LoRCnn_model_attn_down_proj_ks = LoRCnn_model.attn_down_proj_ks
-        LoRCnn_model_attention_predictor_cnns = LoRCnn_model.attention_predictor_cnns
-        LoRCnn_model_attention_predictor_dec_scalers = LoRCnn_model.attention_predictor_dec_scalers
+        LoRCNN_layers = LoRCnn_model.LoRCNN_layers
 
-    torch.save(
-        LoRCnn_model_attn_down_proj_qs.state_dict(),
-        os.path.join(training_args.output_dir, "attn_down_proj_qs.pt"),
-    )
-    torch.save(
-        LoRCnn_model_attn_down_proj_ks.state_dict(),
-        os.path.join(training_args.output_dir, "attn_down_proj_ks.pt"),
-    )
-    torch.save(
-        LoRCnn_model_attention_predictor_cnns.state_dict(),
-        os.path.join(training_args.output_dir, "attention_predictor_cnns.pt"),
-    )
-    torch.save(
-        LoRCnn_model_attention_predictor_dec_scalers.state_dict(),
-        os.path.join(training_args.output_dir, "attention_predictor_dec_scalers.pt"),
-    )
+    # 定义保存路径
+    bin_filename = os.path.join(training_args.output_dir, "LoRCNN_weights.bin")
 
+    # 遍历参数并存入字典
+    merged_weights = {
+        name: param.cpu() for name, param in LoRCNN_layers.named_parameters()
+        if "attn_down_proj" in name or "attention_predictor" in name
+    }
+
+    # 直接保存到 .bin 文件
+    torch.save(merged_weights, bin_filename)
+
+    # for name, param in LoRCNN_layers.named_parameters():
+    #     if "attn_down_proj" in name or "attention_predictor" in name:
+    #         torch.save(
+    #             param,
+    #             os.path.join(training_args.output_dir, f"{name.replace('.', '_')}.pt"),
+    #         )
 
 if __name__ == "__main__":
     train()
