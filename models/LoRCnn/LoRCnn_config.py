@@ -98,7 +98,9 @@ class LoRCnnConfig(PretrainedConfig):
         tie_word_embeddings=False,
         attn_down_proj_dim=1024,
         num_deep_cnn_layers=2,
-        inner_channel=2,
+        kernel_size=63,
+        inner_channel=1,
+        loss_type=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -115,7 +117,9 @@ class LoRCnnConfig(PretrainedConfig):
         # <<< LoRCnn >>>
         self.attn_down_proj_dim = attn_down_proj_dim
         self.num_deep_cnn_layers = num_deep_cnn_layers
+        self.kernel_size = kernel_size
         self.inner_channel = inner_channel
+        self.loss_type = loss_type
         # <<< LoRCnn >>>
 
         super().__init__(
