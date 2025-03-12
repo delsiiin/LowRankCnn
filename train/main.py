@@ -321,16 +321,16 @@ def train():
     # safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
     if hasattr(LoRCnn_model, "module"):
-        LoRCNN_layers = LoRCnn_model.module.LoRCNN_layers
+        LoRCnn_model = LoRCnn_model.module
     else:
-        LoRCNN_layers = LoRCnn_model.LoRCNN_layers
+        LoRCnn_model = LoRCnn_model
 
     # 定义保存路径
     bin_filename = os.path.join(training_args.output_dir, "LoRCNN_weights.bin")
 
     # 遍历参数并存入字典
     merged_weights = {
-        name: param.cpu() for name, param in LoRCNN_layers.named_parameters()
+        name: param.cpu() for name, param in LoRCnn_model.named_parameters()
         if "attn_down_proj" in name or "attention_predictor" in name
     }
 
